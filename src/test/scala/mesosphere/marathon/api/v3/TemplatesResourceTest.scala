@@ -7,23 +7,26 @@ import mesosphere.AkkaUnitTest
 import mesosphere.marathon.api._
 import mesosphere.marathon.api.v2.{AppHelpers, AppNormalization}
 import mesosphere.marathon.core.plugin.PluginManager
-import mesosphere.marathon.experimental.repository.SyncTemplateRepository
+import mesosphere.marathon.experimental.repository.TemplateRepository
 import mesosphere.marathon.plugin.auth.{Authenticator, Authorizer}
 import mesosphere.marathon.raml.{App, Raml}
+import mesosphere.marathon.state.VersionInfo.OnlyVersion
 import mesosphere.marathon.state._
 import mesosphere.marathon.test.{GroupCreation, JerseyTest}
 import org.apache.zookeeper.KeeperException.NoNodeException
+import org.mockito.Matchers
 import play.api.libs.json._
 
 import scala.collection.immutable.Seq
 import scala.concurrent.Future
+import scala.concurrent.duration._
 import scala.util.{Failure, Success}
 
 class TemplatesResourceTest extends AkkaUnitTest with GroupCreation with JerseyTest {
 
   case class Fixture(
       auth: TestAuthFixture = new TestAuthFixture,
-      repository: SyncTemplateRepository = mock[SyncTemplateRepository]) {
+      repository: TemplateRepository = mock[TemplateRepository]) {
     val config: AllConf = AllConf.withTestConfig()
     implicit val mat = ActorMaterializer()
     val templatesResource: TemplatesResource = new TemplatesResource(
@@ -65,105 +68,125 @@ class TemplatesResourceTest extends AkkaUnitTest with GroupCreation with JerseyT
       val app = App(id = "/app", cmd = Some("cmd"))
       val body = appToBytes(app)
       val template = normalizeAndConvert(app)
-      val version = repository.version(template)
+      val version = "1"
 
-      repository.create(any) returns Future.successful(repository.version(template))
+      repository.create(any) returns Future.successful(version)
 
-      When("create is request is made")
+      When("it is created")
       val response = asyncRequest { r =>
         templatesResource.create(body, auth.request, r)
       }
 
-      Then("it is successful")
+      Then("request is successful")
       response.getStatus should be(201)
 
-      And("returned JSON contains the version of created template")
+      And("version of created template is returned")
       JsonTestHelper.assertThatJsonString(response.getEntity.asInstanceOf[String]).correspondsToJsonOf(JsObject(List("version" -> JsString(version))))
     }
 
     "find the latest template version" in new Fixture {
+      Given("two templates with different app version timestamps")
       val app = App(id = "/app", cmd = Some("cmd"))
-      val template = normalizeAndConvert(app)
-      val version = repository.version(template)
+      val normalized = normalize(app)
 
-      repository.contentsSync(any) returns Success(Seq(version))
-      repository.readSync[AppDefinition](any, any) returns Success(template)
+      val templateOne = Raml.fromRaml(normalized)
+      val templateTwo = templateOne.copy(versionInfo = OnlyVersion(templateOne.version + 1.minute))
+
+      And(s"repository returns both saved templates for ${app.id}")
+      val versions = Seq("1", "2")
+
+      repository.children(templateOne.id) returns Success(versions)
+      repository.read[AppDefinition](any, Matchers.eq(versions(0))) returns Success(templateOne)
+      repository.read[AppDefinition](any, Matchers.eq(versions(1))) returns Success(templateTwo)
 
       When("latest template version is requested")
       val response = asyncRequest { r =>
-        templatesResource.latest(template.id.toString, auth.request, r)
+        templatesResource.latest(templateOne.id.toString, auth.request, r)
       }
 
-      Then("it is successful")
+      Then("request is successful")
       response.getStatus should be(200)
+
+      And("returned JSON contains the the latest template with the biggest timestamp")
+      val parsed = Json.parse(response.getEntity.toString)
+      (parsed \ "template" \ "id").as[String] shouldBe app.id
+      (parsed \ "template" \ "version").as[String] shouldBe templateTwo.version.toString
     }
 
     "find a template with provided version" in new Fixture {
       val app = App(id = "/app", cmd = Some("cmd"))
       val template = normalizeAndConvert(app)
-      val version = repository.version(template)
+      val version = "1"
 
-      repository.readSync[AppDefinition](any, any) returns Success(template)
+      repository.read[AppDefinition](any, any) returns Success(template)
 
       When("template version is requested")
       val response = asyncRequest { r =>
         templatesResource.version(template.id.toString, version, auth.request, r)
       }
 
-      Then("it is successful")
+      Then("request is successful")
       response.getStatus should be(200)
+
+      And("template version is returned")
+      val parsed = Json.parse(response.getEntity.toString)
+      (parsed \ "template" \ "id").as[String] shouldBe app.id
     }
 
     "fail to get a template with a non-existing version" in new Fixture {
       val app = App(id = "/app", cmd = Some("cmd"))
       val template = normalizeAndConvert(app)
-      val version = repository.version(template)
+      val version = "1"
 
-      repository.readSync(any, any) returns Failure(new NoNodeException("/templates/app/1"))
+      repository.read(any, any) returns Failure(new NoNodeException(s"/templates/app/${version}"))
 
       When("a non-existing template version is requested")
       val response = asyncRequest { r =>
         templatesResource.version(template.id.toString, version, auth.request, r)
       }
 
-      Then("it should fail")
+      Then("request should fail")
       response.getStatus should be(500)
+
+      And("response should contain information about missing template and version")
+      response.getEntity.toString should include(new TemplateNotFoundException(template.id, Some(version)).getMessage)
     }
 
     "list all versions of the template" in new Fixture {
       val app = App(id = "/app", cmd = Some("cmd"))
       val template = normalizeAndConvert(app)
+      val versions = Seq("1", "2", "3")
 
-      repository.contentsSync(any) returns Success(Seq("1", "2", "3"))
+      repository.children(any) returns Success(versions)
 
       val response = asyncRequest { r =>
         templatesResource.versions(template.id.toString, auth.request, r)
       }
 
-      Then("it is successful")
+      Then("request is successful")
       response.getStatus should be(200)
 
-      And("the JSON is as expected")
+      And("an array with three versions is expected")
 
       JsonTestHelper
         .assertThatJsonString(response.getEntity.asInstanceOf[String])
-        .correspondsToJsonOf(JsObject(List("versions" -> JsArray(Seq("1", "2", "3").map(JsString(_))))))
+        .correspondsToJsonOf(JsObject(List("versions" -> JsArray(versions.map(JsString(_))))))
     }
 
-    "list versions of the template where non exist" in new Fixture {
+    "list versions of the template where none exist" in new Fixture {
       val app = App(id = "/app", cmd = Some("cmd"))
       val template = normalizeAndConvert(app)
 
-      repository.contentsSync(any) returns Success(Seq.empty)
+      repository.children(any) returns Success(Seq.empty)
 
       val response = asyncRequest { r =>
         templatesResource.versions(template.id.toString, auth.request, r)
       }
 
-      Then("it is successful")
+      Then("request is successful")
       response.getStatus should be(200)
 
-      And("the JSON is as expected")
+      And("empty version array is expected")
 
       JsonTestHelper
         .assertThatJsonString(response.getEntity.asInstanceOf[String])
@@ -174,20 +197,23 @@ class TemplatesResourceTest extends AkkaUnitTest with GroupCreation with JerseyT
       val app = App(id = "/app", cmd = Some("cmd"))
       val template = normalizeAndConvert(app)
 
-      repository.contentsSync(any) returns Failure(new NoNodeException("/templates/app/1"))
+      repository.children(any) returns Failure(new NoNodeException("/templates/app"))
 
       val response = asyncRequest { r =>
         templatesResource.versions(template.id.toString, auth.request, r)
       }
 
-      Then("it should fail")
+      Then("request should fail")
       response.getStatus should be(500)
+
+      And("contain the information about missing template")
+      response.getEntity.toString should include(new TemplateNotFoundException(template.id).getMessage)
     }
 
     "delete a template with a provided version" in new Fixture {
       val app = App(id = "/app", cmd = Some("cmd"))
       val template = normalizeAndConvert(app)
-      val version = repository.version(template)
+      val version = "1"
 
       repository.delete(any, any) returns Future.successful(Done)
 
@@ -195,7 +221,7 @@ class TemplatesResourceTest extends AkkaUnitTest with GroupCreation with JerseyT
         templatesResource.delete(template.id.toString, version, auth.request, r)
       }
 
-      Then("it is successful")
+      Then("request is successful")
       response.getStatus should be(200)
     }
 
@@ -208,7 +234,7 @@ class TemplatesResourceTest extends AkkaUnitTest with GroupCreation with JerseyT
         templatesResource.delete(template.id.toString, auth.request, r)
       }
 
-      Then("it is successful")
+      Then("request is successful")
       response.getStatus should be(200)
     }
 

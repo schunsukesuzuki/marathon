@@ -37,7 +37,7 @@ import mesosphere.marathon.core.task.jobs.TaskJobsModule
 import mesosphere.marathon.core.task.termination.TaskTerminationModule
 import mesosphere.marathon.core.task.tracker.InstanceTrackerModule
 import mesosphere.marathon.core.task.update.TaskStatusUpdateProcessor
-import mesosphere.marathon.experimental.repository.SyncTemplateRepository
+import mesosphere.marathon.experimental.repository.TemplateRepository
 import mesosphere.marathon.storage.{StorageConf, StorageConfig, StorageModule}
 import mesosphere.marathon.stream.EnrichedFlow
 import mesosphere.util.NamedExecutionContext
@@ -101,7 +101,7 @@ class CoreModuleImpl @Inject() (
 
   lazy val factory: AsyncCuratorBuilderFactory = AsyncCuratorBuilderFactory(richCuratorFramework.client)
   lazy val store: ZooKeeperPersistenceStore = new ZooKeeperPersistenceStore(metricsModule.metrics, factory, parallelism = 1)(storageExecutionContext)
-  override lazy val templateRepository: SyncTemplateRepository = new SyncTemplateRepository(store, base = "/templates")(actorsModule.materializer)
+  override lazy val templateRepository: TemplateRepository = new TemplateRepository(store, base = "/templates")(actorsModule.materializer)
 
   override lazy val storageModule = StorageModule(
     metricsModule.metrics,
